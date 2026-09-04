@@ -1,4 +1,4 @@
-name: Download Dukascopy Tick Data
+name: Download Dukascopy Tick Data2
 
 on:
   workflow_dispatch:
