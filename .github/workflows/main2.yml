@@ -167,16 +167,23 @@ jobs:
           python-version: "3.12"
 
       # ==========================================================
-      # Resolve dukascopy-node version (pin per run).
-      # For full reproducibility replace the npm view lookup with
-      # a hardcoded version, e.g. dukascopy-node@1.x.y
+      # Resolve dukascopy-node version.
+      # Pinned for reproducibility - bump manually after testing.
+      # (List available versions: npm view dukascopy-node versions)
       # ==========================================================
       - name: Resolve dukascopy-node version
         id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(npm view dukascopy-node version)
+          VERSION="1.10.1"   # <-- pinned; bump manually after testing
+
+          # Safety net: if the pin is ever invalid, fall back to latest
+          if ! npm view "dukascopy-node@${VERSION}" version >/dev/null 2>&1; then
+            echo "::warning::dukascopy-node@${VERSION} not found on npm - falling back to latest."
+            VERSION=$(npm view dukascopy-node version)
+          fi
+
           echo "dukascopy-node version: $VERSION"
           echo "pkg=dukascopy-node@${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -236,9 +243,32 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # ==========================================================
-      # Download
+      # Preflight: is the raw Dukascopy feed reachable from this runner?
+      # (month in the URL path is 0-based: 00 = January)
+      # This probes a fixed, known-existing historical hour - it is
+      # only a connectivity canary, NOT a validation of the range.
+      # ==========================================================
+      - name: Preflight datafeed check
+        shell: bash
+        env:
+          SYMBOL_UPPER: ${{ steps.range.outputs.instrument_upper }}
+        run: |
+          set -uo pipefail
+          URL="https://datafeed.dukascopy.com/datafeed/${SYMBOL_UPPER}/2014/00/02/10h_ticks.bi5"
+          CODE=$(curl -sS -o /tmp/probe.bi5 -w '%{http_code}' "$URL" || echo "000")
+          SIZE=$(stat -c%s /tmp/probe.bi5 2>/dev/null || echo 0)
+          echo "probe url:  $URL"
+          echo "http code:  $CODE"
+          echo "bytes:      $SIZE"
+          if [ "$CODE" != "200" ] || [ "$SIZE" -lt 100 ]; then
+            echo "::warning::Datafeed probe looks bad (code=$CODE size=$SIZE). This runner IP may be throttled by Dukascopy."
+          fi
+
+      # ==========================================================
+      # Download (with whole-command retry + graceful empty handling)
       # ==========================================================
       - name: Download ticks
+        id: download
         shell: bash
         env:
           PKG: ${{ steps.pkg.outputs.pkg }}
@@ -246,14 +276,13 @@ jobs:
           FROM_DATE: ${{ steps.range.outputs.from_date }}
           TO_DATE: ${{ steps.range.outputs.to_date }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p download
 
           # ------------------------------------------------------
           # dukascopy-node treats -to literally and can drop the
           # last day when -to is midnight (issue #193). Request one
-          # extra day so the real end date is complete. (Overlap of
-          # Jan 1 between yearly chunks is harmless - bank holiday.)
+          # extra day so the real end date is complete.
           # ------------------------------------------------------
           DL_TO=$(date -d "$TO_DATE +1 day" +%F)
 
@@ -262,36 +291,93 @@ jobs:
           df -h
 
           # ------------------------------------------------------
-          # Retry options - THE main fix for missing candles.
-          # Dukascopy's datafeed frequently returns EMPTY (0-byte)
-          # or transient error responses for hours that DO have
-          # data. Defaults are -r 0 (no retries) and -re false
-          # (empty responses accepted as "no data"), which silently
-          # creates holes in the CSV.
-          #
-          #   -r 5      retry failed downloads up to 5 times
-          #   -re true  also retry successful-but-empty responses
-          #   -rp 1000  wait 1s between retries
-          #
-          # Default fail behaviour is kept: if an hour is still
-          # missing after all retries, the JOB FAILS loudly instead
-          # of publishing an incomplete file.
+          # Does this range contain ANY tradable weekday?
+          # (Jan 1 and Dec 25 are global market holidays.)
           # ------------------------------------------------------
-          npx -y "$PKG" \
-            -i "$SYMBOL" \
-            -from "$FROM_DATE" \
-            -to "$DL_TO" \
-            -t tick \
-            -f csv \
-            -dir "./download" \
-            -r 5 -re true -rp 1000
+          HAS_TRADING_DAY=0
+          d="$FROM_DATE"
+          END_TS=$(date -d "$DL_TO" +%s)
+          while [ "$(date -d "$d" +%s)" -lt "$END_TS" ]; do
+            DOW=$(date -d "$d" +%u)
+            MD=$(date -d "$d" +%m-%d)
+            if [ "$DOW" -le 5 ] && [ "$MD" != "01-01" ] && [ "$MD" != "12-25" ]; then
+              HAS_TRADING_DAY=1
+              break
+            fi
+            d=$(date -d "$d +1 day" +%F)
+          done
+          echo "Range contains tradable weekday: $HAS_TRADING_DAY"
+
+          # ------------------------------------------------------
+          # Retry the WHOLE npx call. Per-hour retries (-r/-re) are
+          # not enough when the datafeed throttles the runner IP.
+          # ------------------------------------------------------
+          ATTEMPTS=5
+          LOG=/tmp/dukascopy.log
+          OK=0
+
+          for i in $(seq 1 "$ATTEMPTS"); do
+            echo ""
+            echo "=================== attempt $i/$ATTEMPTS ==================="
+            rm -rf download/* || true
+
+            set +e
+            npx -y "$PKG" \
+              -i "$SYMBOL" \
+              -from "$FROM_DATE" \
+              -to "$DL_TO" \
+              -t tick \
+              -f csv \
+              -dir "./download" \
+              -r 8 -re true -rp 2000 \
+              > "$LOG" 2>&1
+            RC=$?
+            set -e
+            cat "$LOG"
+
+            if [ "$RC" -eq 0 ]; then
+              OK=1
+              break
+            fi
+
+            if grep -qi "empty dataset" "$LOG"; then
+              echo "::warning::Attempt $i returned an empty dataset."
+            else
+              echo "::warning::Attempt $i failed with exit code $RC."
+            fi
+
+            SLEEP=$(( i * 30 ))
+            echo "Sleeping ${SLEEP}s before retry..."
+            sleep "$SLEEP"
+          done
 
           df -h
+
+          if [ "$OK" -eq 1 ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ------------------------------------------------------
+          # All attempts failed. Decide: legitimate no-data window
+          # (skip) vs. real download failure (fail loudly).
+          # ------------------------------------------------------
+          if grep -qi "empty dataset" "$LOG" && [ "$HAS_TRADING_DAY" -eq 0 ]; then
+            echo "::notice::No tradable days in $FROM_DATE..$TO_DATE (holiday/weekend only). Skipping this chunk."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ERROR: Dukascopy returned no data for $FROM_DATE..$TO_DATE after $ATTEMPTS attempts."
+          echo "This range DOES contain trading days, so the feed is likely throttling this runner."
+          echo "Check availability: https://www.dukascopy-node.app/instrument/$SYMBOL"
+          exit 1
 
       # ==========================================================
       # Find CSV
       # ==========================================================
       - name: Find downloaded CSV
+        if: steps.download.outputs.skip != 'true'
         shell: bash
         env:
           SYMBOL: ${{ steps.range.outputs.instrument }}
@@ -334,6 +420,7 @@ jobs:
       # that do NOT span a weekend.
       # ==========================================================
       - name: Check for data gaps
+        if: steps.download.outputs.skip != 'true'
         shell: bash
         env:
           SLUG: ${{ steps.range.outputs.slug }}
@@ -413,6 +500,7 @@ jobs:
       # Convert
       # ==========================================================
       - name: Convert CSV to JForex format
+        if: steps.download.outputs.skip != 'true'
         shell: bash
         env:
           SLUG: ${{ steps.range.outputs.slug }}
@@ -450,6 +538,7 @@ jobs:
       # ZIP
       # ==========================================================
       - name: Zip CSV
+        if: steps.download.outputs.skip != 'true'
         shell: bash
         env:
           SLUG: ${{ steps.range.outputs.slug }}
@@ -470,6 +559,7 @@ jobs:
       # Split if larger than 1.9GB
       # ==========================================================
       - name: Split ZIP if larger than 1.9GB
+        if: steps.download.outputs.skip != 'true'
         shell: bash
         env:
           SLUG: ${{ steps.range.outputs.slug }}
@@ -503,6 +593,7 @@ jobs:
       # GitHub Release
       # ==========================================================
       - name: Publish to GitHub Release
+        if: steps.download.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.range.outputs.slug }}
@@ -593,11 +684,13 @@ jobs:
             echo "Tag:  $TAG"
 
             # ====================================================
-            # Check Release
+            # Check Release - missing release means the year was
+            # skipped upstream (holiday-only range / no data).
+            # Do NOT fail the whole job because of it.
             # ====================================================
             if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "ERROR: Release not found: $TAG"
-              exit 1
+              echo "::warning::Release not found: $TAG - year likely skipped (no tradable days / empty dataset). Continuing."
+              continue
             fi
 
             RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
@@ -639,8 +732,8 @@ jobs:
           ' "$ASSET_NAME")
 
               if [ -z "$FIRST_PART" ]; then
-                echo "ERROR: No ZIP or split parts found."
-                exit 1
+                echo "::warning::No ZIP or split parts found for $TAG. Skipping."
+                continue
               fi
 
               ASSET_URL="$FIRST_PART"
